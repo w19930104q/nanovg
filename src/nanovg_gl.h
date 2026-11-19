@@ -113,6 +113,9 @@ enum NVGimageFlagsGL {
 #include <math.h>
 #include "nanovg.h"
 
+#define GLNVG__QUOTE(x) #x
+#define GLNVG__STR(x) GLNVG__QUOTE(x)
+
 enum GLNVGuniformLoc {
 	GLNVG_LOC_VIEWSIZE,
 	GLNVG_LOC_TEX,
@@ -187,6 +190,11 @@ struct GLNVGpath {
 };
 typedef struct GLNVGpath GLNVGpath;
 
+// Each additional scissor rect (see NVG_MAX_SCISSOR_RECTS in nanovg.h)
+// is stored as 4 vec4s: 3 for the 3x4 matrix and 1 for
+// (extent.x, extent.y, scale.x, scale.y).
+#define GLNVG_SCISSOR_EXTRA_VEC4S ((NVG_MAX_SCISSOR_RECTS-1)*4)
+
 struct GLNVGfragUniforms {
 	#if NANOVG_GL_USE_UNIFORMBUFFER
 		float scissorMat[12]; // matrices are actually 3 vec4s
@@ -202,10 +210,13 @@ struct GLNVGfragUniforms {
 		float strokeThr;
 		int texType;
 		int type;
+		int scissorCount;
+		int scissorPad[3]; // pads scissorRects to std140 vec4 alignment
+		float scissorRects[GLNVG_SCISSOR_EXTRA_VEC4S][4];
 	#else
 		// note: after modifying layout or size of uniform array,
 		// don't forget to also update the fragment shader source!
-		#define NANOVG_GL_UNIFORMARRAY_SIZE 11
+		#define NANOVG_GL_UNIFORMARRAY_SIZE (12 + GLNVG_SCISSOR_EXTRA_VEC4S)
 		union {
 			struct {
 				float scissorMat[12]; // matrices are actually 3 vec4s
@@ -221,6 +232,9 @@ struct GLNVGfragUniforms {
 				float strokeThr;
 				float texType;
 				float type;
+				float scissorCount;
+				float scissorPad[3];
+				float scissorRects[GLNVG_SCISSOR_EXTRA_VEC4S][4];
 			};
 			float uniformArray[NANOVG_GL_UNIFORMARRAY_SIZE][4];
 		};
@@ -528,8 +542,10 @@ static int glnvg__renderCreate(void* uptr)
 #if NANOVG_GL_USE_UNIFORMBUFFER
 	"#define USE_UNIFORMBUFFER 1\n"
 #else
-	"#define UNIFORMARRAY_SIZE 11\n"
+	"#define UNIFORMARRAY_SIZE " GLNVG__STR(NANOVG_GL_UNIFORMARRAY_SIZE) "\n"
 #endif
+	"#define SCISSOR_EXTRA_RECTS " GLNVG__STR(NVG_MAX_SCISSOR_RECTS-1) "\n"
+	"#define SCISSOR_RECT_VEC4S " GLNVG__STR(GLNVG_SCISSOR_EXTRA_VEC4S) "\n"
 	"\n";
 
 	static const char* fillVertShader =
@@ -576,7 +592,10 @@ static int glnvg__renderCreate(void* uptr)
 		"		float strokeThr;\n"
 		"		int texType;\n"
 		"		int type;\n"
+		"		int scissorCount;\n"
+		"		vec4 scissorRects[SCISSOR_RECT_VEC4S];\n"
 		"	};\n"
+		"	#define SCISSOR_RECT(i) scissorRects[i]\n"
 		"#else\n" // NANOVG_GL3 && !USE_UNIFORMBUFFER
 		"	uniform vec4 frag[UNIFORMARRAY_SIZE];\n"
 		"#endif\n"
@@ -604,6 +623,8 @@ static int glnvg__renderCreate(void* uptr)
 		"	#define strokeThr frag[10].y\n"
 		"	#define texType int(frag[10].z)\n"
 		"	#define type int(frag[10].w)\n"
+		"	#define scissorCount int(frag[11].x)\n"
+		"	#define SCISSOR_RECT(i) frag[12 + (i)]\n"
 		"#endif\n"
 		"\n"
 		"float sdroundrect(vec2 pt, vec2 ext, float rad) {\n"
@@ -616,7 +637,17 @@ static int glnvg__renderCreate(void* uptr)
 		"float scissorMask(vec2 p) {\n"
 		"	vec2 sc = (abs((scissorMat * vec3(p,1.0)).xy) - scissorExt);\n"
 		"	sc = vec2(0.5,0.5) - sc * scissorScale;\n"
-		"	return clamp(sc.x,0.0,1.0) * clamp(sc.y,0.0,1.0);\n"
+		"	float mask = clamp(sc.x,0.0,1.0) * clamp(sc.y,0.0,1.0);\n"
+		"	// Intersect with the additional scissor rects (nested scissoring).\n"
+		"	for (int i = 0; i < SCISSOR_EXTRA_RECTS; i++) {\n"
+		"		if (i >= scissorCount - 1) break;\n"
+		"		mat3 m = mat3(SCISSOR_RECT(i*4).xyz, SCISSOR_RECT(i*4+1).xyz, SCISSOR_RECT(i*4+2).xyz);\n"
+		"		vec4 es = SCISSOR_RECT(i*4+3);\n"
+		"		sc = (abs((m * vec3(p,1.0)).xy) - es.xy);\n"
+		"		sc = vec2(0.5,0.5) - sc * es.zw;\n"
+		"		mask *= clamp(sc.x,0.0,1.0) * clamp(sc.y,0.0,1.0);\n"
+		"	}\n"
+		"	return mask;\n"
 		"}\n"
 		"#ifdef EDGE_AA\n"
 		"// Stroke - from [0..1] to clipped pyramid, where the slope is 1px.\n"
@@ -911,13 +942,19 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 {
 	GLNVGtexture* tex = NULL;
 	float invxform[6];
+	int i, nscissor;
 
 	memset(frag, 0, sizeof(*frag));
 
 	frag->innerCol = glnvg__premulColor(paint->innerColor);
 	frag->outerCol = glnvg__premulColor(paint->outerColor);
 
+	nscissor = scissor->nrects;
+	if (nscissor < 1) nscissor = 1;
+	if (nscissor > NVG_MAX_SCISSOR_RECTS) nscissor = NVG_MAX_SCISSOR_RECTS;
+
 	if (scissor->extent[0] < -0.5f || scissor->extent[1] < -0.5f) {
+		nscissor = 0;
 		memset(frag->scissorMat, 0, sizeof(frag->scissorMat));
 		frag->scissorExt[0] = 1.0f;
 		frag->scissorExt[1] = 1.0f;
@@ -930,7 +967,27 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 		frag->scissorExt[1] = scissor->extent[1];
 		frag->scissorScale[0] = sqrtf(scissor->xform[0]*scissor->xform[0] + scissor->xform[2]*scissor->xform[2]) / fringe;
 		frag->scissorScale[1] = sqrtf(scissor->xform[1]*scissor->xform[1] + scissor->xform[3]*scissor->xform[3]) / fringe;
+
+		// Additional scissor rects of nested scissoring, each stored as
+		// 3x4 matrix followed by (extent.x, extent.y, scale.x, scale.y).
+		for (i = 1; i < nscissor; i++) {
+			const float* xform = scissor->xform2[i-1];
+			const float* extent = scissor->extent2[i-1];
+			float* dst = &frag->scissorRects[(i-1)*4][0];
+			nvgTransformInverse(invxform, xform);
+			glnvg__xformToMat3x4(dst, invxform);
+			dst[12] = extent[0];
+			dst[13] = extent[1];
+			dst[14] = sqrtf(xform[0]*xform[0] + xform[2]*xform[2]) / fringe;
+			dst[15] = sqrtf(xform[1]*xform[1] + xform[3]*xform[3]) / fringe;
+		}
 	}
+
+	#if NANOVG_GL_USE_UNIFORMBUFFER
+	frag->scissorCount = nscissor;
+	#else
+	frag->scissorCount = (float)nscissor;
+	#endif
 
 	memcpy(frag->extent, paint->extent, sizeof(frag->extent));
 	frag->strokeMult = (width*0.5f + fringe*0.5f) / fringe;

@@ -662,6 +662,7 @@ void nvgReset(NVGcontext* ctx)
 
 	state->scissor.extent[0] = -1.0f;
 	state->scissor.extent[1] = -1.0f;
+	state->scissor.nrects = 0;
 
 	state->fontSize = 16.0f;
 	state->letterSpacing = 0.0f;
@@ -978,6 +979,7 @@ void nvgScissor(NVGcontext* ctx, float x, float y, float w, float h)
 
 	state->scissor.extent[0] = w*0.5f;
 	state->scissor.extent[1] = h*0.5f;
+	state->scissor.nrects = 1;
 }
 
 static void nvg__isectRects(float* dst,
@@ -994,6 +996,133 @@ static void nvg__isectRects(float* dst,
 	dst[3] = nvg__maxf(0.0f, maxy - miny);
 }
 
+// Returns 1 if the 2D transform maps the coordinate axes onto themselves,
+// i.e. it is composed of translation, (anisotropic) scale, flips and 90
+// degree rotations. Small numerical noise (e.g. cosf(NVG_PI/2) != 0) is
+// tolerated so that transforms which are axis aligned in practice take
+// the same code path as before.
+static int nvg__xformIsAxisAligned(const float* t)
+{
+	const float eps = 1e-6f;
+	if (nvg__absf(t[1]) <= eps*nvg__absf(t[0]) &&
+		nvg__absf(t[2]) <= eps*nvg__absf(t[3]))
+		return 1;
+	if (nvg__absf(t[0]) <= eps*nvg__absf(t[1]) &&
+		nvg__absf(t[3]) <= eps*nvg__absf(t[2]))
+		return 1;
+	return 0;
+}
+
+// Area of a scissor rect (up to a constant factor), used to find the
+// least restrictive rect.
+static float nvg__scissorRectArea(const float* xform, const float* extent)
+{
+	float det = xform[0]*xform[3] - xform[2]*xform[1];
+	return extent[0]*extent[1]*nvg__absf(det);
+}
+
+// Sets scissor rect 'i' (0 = xform/extent, i-1 = xform2/extent2) of the
+// scissor to the specified rectangle in current transform space.
+static void nvg__setScissorRect(NVGstate* state, int i, float x, float y, float w, float h)
+{
+	float* xform;
+	float* extent;
+	if (i == 0) {
+		xform = state->scissor.xform;
+		extent = state->scissor.extent;
+	} else {
+		xform = state->scissor.xform2[i-1];
+		extent = state->scissor.extent2[i-1];
+	}
+	nvgTransformIdentity(xform);
+	xform[4] = x+w*0.5f;
+	xform[5] = y+h*0.5f;
+	nvgTransformMultiply(xform, state->xform);
+	extent[0] = w*0.5f;
+	extent[1] = h*0.5f;
+}
+
+static float nvg__getScissorRectArea(NVGscissor* scissor, int i)
+{
+	if (i == 0)
+		return nvg__scissorRectArea(scissor->xform, scissor->extent);
+	return nvg__scissorRectArea(scissor->xform2[i-1], scissor->extent2[i-1]);
+}
+
+static void nvg__copyScissorRect(NVGscissor* scissor, int dst, int src)
+{
+	float* dxform;
+	float* dextent;
+	const float* sxform;
+	const float* sextent;
+	if (dst == src) return;
+	if (dst == 0) {
+		dxform = scissor->xform;
+		dextent = scissor->extent;
+	} else {
+		dxform = scissor->xform2[dst-1];
+		dextent = scissor->extent2[dst-1];
+	}
+	if (src == 0) {
+		sxform = scissor->xform;
+		sextent = scissor->extent;
+	} else {
+		sxform = scissor->xform2[src-1];
+		sextent = scissor->extent2[src-1];
+	}
+	memcpy(dxform, sxform, sizeof(float)*6);
+	dextent[0] = sextent[0];
+	dextent[1] = sextent[1];
+}
+
+// Adds the specified rectangle (in current transform space) to the
+// scissor intersection.
+static void nvg__appendScissorRect(NVGstate* state, float x, float y, float w, float h)
+{
+	NVGscissor* scissor = &state->scissor;
+	float nxform[6];
+	float nextent[2];
+	float area, maxArea;
+	int i, drop;
+
+	w = nvg__maxf(0.0f, w);
+	h = nvg__maxf(0.0f, h);
+
+	if (scissor->nrects < NVG_MAX_SCISSOR_RECTS) {
+		nvg__setScissorRect(state, scissor->nrects, x, y, w, h);
+		scissor->nrects++;
+		return;
+	}
+
+	// The scissor rect stack is full. Drop the least restrictive rect
+	// (the one with the largest area) so that the resulting intersection
+	// stays a conservative superset of the true intersection.
+	nvgTransformIdentity(nxform);
+	nxform[4] = x+w*0.5f;
+	nxform[5] = y+h*0.5f;
+	nvgTransformMultiply(nxform, state->xform);
+	nextent[0] = w*0.5f;
+	nextent[1] = h*0.5f;
+
+	maxArea = nvg__scissorRectArea(nxform, nextent);
+	drop = -1;
+	for (i = 0; i < scissor->nrects; i++) {
+		area = nvg__getScissorRectArea(scissor, i);
+		if (area > maxArea) {
+			maxArea = area;
+			drop = i;
+		}
+	}
+
+	if (drop < 0)
+		return; // The new rect is the least restrictive one, ignore it.
+
+	// Remove the dropped rect and append the new one.
+	for (i = drop; i < scissor->nrects-1; i++)
+		nvg__copyScissorRect(scissor, i, i+1);
+	nvg__setScissorRect(state, scissor->nrects-1, x, y, w, h);
+}
+
 void nvgIntersectScissor(NVGcontext* ctx, float x, float y, float w, float h)
 {
 	NVGstate* state = nvg__getState(ctx);
@@ -1008,19 +1137,31 @@ void nvgIntersectScissor(NVGcontext* ctx, float x, float y, float w, float h)
 	}
 
 	// Transform the current scissor rect into current transform space.
-	// If there is difference in rotation, this will be approximation.
 	memcpy(pxform, state->scissor.xform, sizeof(float)*6);
 	ex = state->scissor.extent[0];
 	ey = state->scissor.extent[1];
 	nvgTransformInverse(invxorm, state->xform);
 	nvgTransformMultiply(pxform, invxorm);
-	tex = ex*nvg__absf(pxform[0]) + ey*nvg__absf(pxform[2]);
-	tey = ex*nvg__absf(pxform[1]) + ey*nvg__absf(pxform[3]);
 
-	// Intersect rects.
-	nvg__isectRects(rect, pxform[4]-tex,pxform[5]-tey,tex*2,tey*2, x,y,w,h);
+	if (state->scissor.nrects == 1 && nvg__xformIsAxisAligned(pxform)) {
+		// The previous scissor rect is axis aligned in the current
+		// transform space, so the intersection is a rectangle as well.
+		// This is the same computation as before, and produces identical
+		// output for axis aligned scissoring.
+		tex = ex*nvg__absf(pxform[0]) + ey*nvg__absf(pxform[2]);
+		tey = ex*nvg__absf(pxform[1]) + ey*nvg__absf(pxform[3]);
 
-	nvgScissor(ctx, rect[0], rect[1], rect[2], rect[3]);
+		// Intersect rects.
+		nvg__isectRects(rect, pxform[4]-tex,pxform[5]-tey,tex*2,tey*2, x,y,w,h);
+
+		nvgScissor(ctx, rect[0], rect[1], rect[2], rect[3]);
+		return;
+	}
+
+	// General case: the intersection of arbitrarily transformed rects is
+	// not a rect. Keep the intersection exact by adding the new rect to
+	// the scissor; the renderer intersects all the rects.
+	nvg__appendScissorRect(state, x, y, w, h);
 }
 
 void nvgResetScissor(NVGcontext* ctx)
@@ -1029,6 +1170,7 @@ void nvgResetScissor(NVGcontext* ctx)
 	memset(state->scissor.xform, 0, sizeof(state->scissor.xform));
 	state->scissor.extent[0] = -1.0f;
 	state->scissor.extent[1] = -1.0f;
+	state->scissor.nrects = 0;
 }
 
 // Global composite operation.

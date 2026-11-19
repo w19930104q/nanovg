@@ -432,10 +432,13 @@ void nvgScissor(NVGcontext* ctx, float x, float y, float w, float h);
 
 // Intersects current scissor rectangle with the specified rectangle.
 // The scissor rectangle is transformed by the current transform.
-// Note: in case the rotation of previous scissor rect differs from
-// the current one, the intersection will be done between the specified
-// rectangle and the previous scissor rectangle transformed in the current
-// transform space. The resulting shape is always rectangle.
+// The intersection is exact for arbitrary transforms: if the rotation of
+// the previous scissor rect differs from the current one, the scissor is
+// stored as the intersection of the individual rectangles (up to
+// NVG_MAX_SCISSOR_RECTS rects), and the antialiased edges of each rect
+// are evaluated by the renderer. If the previous scissor and the
+// specified rectangle are axis aligned relative to each other, the
+// intersection is collapsed into a single rectangle, exactly as before.
 void nvgIntersectScissor(NVGcontext* ctx, float x, float y, float w, float h);
 
 // Reset and disables scissoring.
@@ -632,9 +635,32 @@ enum NVGtexture {
 	NVG_TEXTURE_RGBA = 0x02,
 };
 
+// Maximum number of scissor rectangles that make up the current scissor.
+// Nested nvgIntersectScissor() calls with differing rotations are
+// intersected exactly by keeping each rectangle and evaluating all of
+// them in the renderer. If more than NVG_MAX_SCISSOR_RECTS rotated
+// rectangles are nested, the least restrictive rectangle is dropped, so
+// the result stays a (conservative) superset of the true intersection.
+// Note: each rect costs 4 vec4 uniforms per draw call in the GL renderer;
+// lower this on fragment-uniform-limited (e.g. GLES2) targets.
+#ifndef NVG_MAX_SCISSOR_RECTS
+#define NVG_MAX_SCISSOR_RECTS 8
+#endif
+
+#if NVG_MAX_SCISSOR_RECTS < 2
+#error "NVG_MAX_SCISSOR_RECTS must be at least 2"
+#endif
+
 struct NVGscissor {
+	// First scissor rectangle: transform and half-size (extent).
+	// extent[0] < 0 means that scissoring is disabled.
 	float xform[6];
 	float extent[2];
+	// Number of scissor rectangles in the intersection (0 if disabled).
+	// Rectangles 2..nrects are stored in xform2/extent2 below.
+	int nrects;
+	float xform2[NVG_MAX_SCISSOR_RECTS-1][6];
+	float extent2[NVG_MAX_SCISSOR_RECTS-1][2];
 };
 typedef struct NVGscissor NVGscissor;
 
