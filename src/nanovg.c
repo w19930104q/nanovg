@@ -211,6 +211,8 @@ static void nvg__setDevicePixelRatio(NVGcontext* ctx, float ratio)
 	ctx->devicePxRatio = ratio;
 }
 
+static void nvg__flushTextTexture(NVGcontext* ctx);
+
 static NVGcompositeOperationState nvg__compositeOperationState(int op)
 {
 	int sfactor, dfactor;
@@ -396,6 +398,9 @@ void nvgCancelFrame(NVGcontext* ctx)
 
 void nvgEndFrame(NVGcontext* ctx)
 {
+	// Upload the font atlas texture once per frame, just before the
+	// queued draw calls are flushed, instead of once per text run.
+	nvg__flushTextTexture(ctx);
 	ctx->params.renderFlush(ctx->params.userPtr);
 	if (ctx->fontImageIdx != 0) {
 		int fontImage = ctx->fontImages[ctx->fontImageIdx];
@@ -2531,9 +2536,8 @@ float nvgText(NVGcontext* ctx, float x, float y, const char* string, const char*
 		}
 	}
 
-	// TODO: add back-end bit to do this just once per frame.
-	nvg__flushTextTexture(ctx);
-
+	// The font atlas texture is uploaded once per frame in nvgEndFrame(),
+	// just before the queued draw calls are flushed to the back-end.
 	nvg__renderText(ctx, verts, nverts);
 
 	return iter.nextx / scale;
