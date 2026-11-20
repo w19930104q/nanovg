@@ -833,39 +833,62 @@ static int glnvg__renderUpdateTexture(void* uptr, int image, int x, int y, int w
 	GLNVGtexture* tex = glnvg__findTexture(gl, image);
 
 	if (tex == NULL) return 0;
-	glnvg__bindTexture(gl, tex->tex);
+	if (data == NULL || w <= 0 || h <= 0) return 0;
+	// Reject regions that are not fully contained in the texture.
+	if (x < 0 || y < 0 || x > tex->width - w || y > tex->height - h) return 0;
 
+	glnvg__bindTexture(gl, tex->tex);
 	glPixelStorei(GL_UNPACK_ALIGNMENT,1);
 
 #ifndef NANOVG_GLES2
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, tex->width);
-	glPixelStorei(GL_UNPACK_SKIP_PIXELS, x);
-	glPixelStorei(GL_UNPACK_SKIP_ROWS, y);
-#else
-	// No support for all of skip, need to update a whole row at a time.
-	if (tex->type == NVG_TEXTURE_RGBA)
-		data += y*tex->width*4;
-	else
-		data += y*tex->width;
-	x = 0;
-	w = tex->width;
-#endif
+	// Desktop GL / GLES3: the region data is tightly packed, tell the
+	// unpacker that each source row is only 'w' pixels wide.
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
+	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 
 	if (tex->type == NVG_TEXTURE_RGBA)
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x,y, w,h, GL_RGBA, GL_UNSIGNED_BYTE, data);
 	else
-#if defined(NANOVG_GLES2) || defined(NANOVG_GL2)
+#if defined(NANOVG_GL2)
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x,y, w,h, GL_LUMINANCE, GL_UNSIGNED_BYTE, data);
 #else
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x,y, w,h, GL_RED, GL_UNSIGNED_BYTE, data);
 #endif
 
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-#ifndef NANOVG_GLES2
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 	glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+#else
+	// GLES2 has no UNPACK_ROW_LENGTH/SKIP_PIXELS/SKIP_ROWS. The region data
+	// is tightly packed, so upload it one row at a time; pixels outside the
+	// requested region are never touched. A full-width region still takes a
+	// single glTexSubImage2D call.
+	{
+		int bpp = tex->type == NVG_TEXTURE_RGBA ? 4 : 1;
+		int row;
+		for (row = 0; row < h; row++) {
+			const unsigned char* rowData = data + row * w * bpp;
+			if (tex->type == NVG_TEXTURE_RGBA)
+				glTexSubImage2D(GL_TEXTURE_2D, 0, x, y+row, w,1, GL_RGBA, GL_UNSIGNED_BYTE, rowData);
+			else
+				glTexSubImage2D(GL_TEXTURE_2D, 0, x, y+row, w,1, GL_LUMINANCE, GL_UNSIGNED_BYTE, rowData);
+		}
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 #endif
+
+	// A sub-region upload only changes level 0; regenerate the mip chain so
+	// minified sampling stays consistent with the updated pixels.
+	if (tex->flags & NVG_IMAGE_GENERATE_MIPMAPS) {
+#if defined(NANOVG_GL2)
+		// GL2 keeps GL_GENERATE_MIPMAP enabled from texture creation, which
+		// regenerates the chain automatically on tex(sub)image updates.
+#else
+		glGenerateMipmap(GL_TEXTURE_2D);
+#endif
+	}
 
 	glnvg__bindTexture(gl, 0);
 

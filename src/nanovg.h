@@ -382,6 +382,17 @@ int nvgCreateImageRGBA(NVGcontext* ctx, int w, int h, int imageFlags, const unsi
 // Updates image data specified by image handle.
 void nvgUpdateImage(NVGcontext* ctx, int image, const unsigned char* data);
 
+// Updates a sub-region of an image. The region (x,y,w,h) is given in pixels
+// and must lie completely inside the image; data is tightly packed for the
+// region (rows of w pixels, 4 bytes per pixel for RGBA images, 1 byte for
+// alpha font atlases). Pixels outside the region are preserved.
+// Returns 1 on success, 0 if the region is out of bounds, the image handle
+// is invalid (e.g. deleted), or data is NULL.
+// The GLES2 back-end uploads the region one row at a time because it lacks
+// row-skip pixel-store support; the visible result is identical across the
+// GL2/GL3/GLES2/GLES3 back-ends.
+int nvgUpdateImageRegion(NVGcontext* ctx, int image, int x, int y, int w, int h, const unsigned char* data);
+
 // Returns the dimensions of a created image.
 void nvgImageSize(NVGcontext* ctx, int image, int* w, int* h);
 
@@ -663,6 +674,9 @@ struct NVGparams {
 	int (*renderCreate)(void* uptr);
 	int (*renderCreateTexture)(void* uptr, int type, int w, int h, int imageFlags, const unsigned char* data);
 	int (*renderDeleteTexture)(void* uptr, int image);
+	// data is tightly packed for the (x,y,w,h) region (region-width rows,
+	// not texture-width rows); implementations must preserve texels outside
+	// the region and reject any region not fully contained in the texture.
 	int (*renderUpdateTexture)(void* uptr, int image, int x, int y, int w, int h, const unsigned char* data);
 	int (*renderGetTextureSize)(void* uptr, int image, int* w, int* h);
 	void (*renderViewport)(void* uptr, float width, float height, float devicePixelRatio);

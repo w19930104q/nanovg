@@ -839,6 +839,24 @@ void nvgUpdateImage(NVGcontext* ctx, int image, const unsigned char* data)
 	ctx->params.renderUpdateTexture(ctx->params.userPtr, image, 0,0, w,h, data);
 }
 
+int nvgUpdateImageRegion(NVGcontext* ctx, int image, int x, int y, int w, int h, const unsigned char* data)
+{
+	int iw, ih;
+	if (data == NULL)
+		return 0;
+	// Reject empty and invalid regions.
+	if (w <= 0 || h <= 0)
+		return 0;
+	// Invalid handle (never created or already deleted): renderGetTextureSize
+	// reports 0x0, so every region fails the bounds check below.
+	if (ctx->params.renderGetTextureSize(ctx->params.userPtr, image, &iw, &ih) == 0)
+		return 0;
+	// Reject any region that is not fully contained in the image.
+	if (x < 0 || y < 0 || x > iw - w || y > ih - h)
+		return 0;
+	return ctx->params.renderUpdateTexture(ctx->params.userPtr, image, x, y, w, h, data);
+}
+
 void nvgImageSize(NVGcontext* ctx, int image, int* w, int* h)
 {
 	ctx->params.renderGetTextureSize(ctx->params.userPtr, image, w, h);
@@ -2412,7 +2430,16 @@ static void nvg__flushTextTexture(NVGcontext* ctx)
 			int y = dirty[1];
 			int w = dirty[2] - dirty[0];
 			int h = dirty[3] - dirty[1];
-			ctx->params.renderUpdateTexture(ctx->params.userPtr, fontImage, x,y, w,h, data);
+			// The font atlas stores one byte per texel; hand the back-end a
+			// tightly packed copy of the dirty region (renderUpdateTexture
+			// expects region-sized rows, not full-atlas rows).
+			unsigned char* region = (unsigned char*)malloc((size_t)w*h);
+			int row;
+			if (region == NULL) return;
+			for (row = 0; row < h; row++)
+				memcpy(region + row*w, data + (y+row)*iw + x, (size_t)w);
+			ctx->params.renderUpdateTexture(ctx->params.userPtr, fontImage, x,y, w,h, region);
+			free(region);
 		}
 	}
 }
