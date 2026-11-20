@@ -2740,6 +2740,11 @@ int nvgTextBreakLines(NVGcontext* ctx, const char* string, const char* end, floa
 				}
 			} else {
 				float nextWidth = iter.nextx - rowStartX;
+				// Geometry of the row before appending the current glyph. A break
+				// point located at the current glyph excludes it, so its recorded
+				// geometry must be the one measured before the glyph was added.
+				float prevRowWidth = rowWidth;
+				float prevRowMaxX = rowMaxX;
 
 				// track last non-white space character
 				if (type == NVG_CHAR || type == NVG_CJK_CHAR) {
@@ -2748,10 +2753,17 @@ int nvgTextBreakLines(NVGcontext* ctx, const char* string, const char* end, floa
 					rowMaxX = q.x1 - rowStartX;
 				}
 				// track last end of a word
-				if (((ptype == NVG_CHAR || ptype == NVG_CJK_CHAR) && type == NVG_SPACE) || type == NVG_CJK_CHAR) {
+				if ((ptype == NVG_CHAR || ptype == NVG_CJK_CHAR) && type == NVG_SPACE) {
 					breakEnd = iter.str;
 					breakWidth = rowWidth;
 					breakMaxX = rowMaxX;
+				} else if (type == NVG_CJK_CHAR) {
+					// Every CJK character is a legal break opportunity. The break
+					// happens before this glyph, so record the row geometry without
+					// its advance instead of the rowWidth just updated above.
+					breakEnd = iter.str;
+					breakWidth = prevRowWidth;
+					breakMaxX = prevRowMaxX;
 				}
 				// track last beginning of a word
 				if ((ptype == NVG_SPACE && (type == NVG_CHAR || type == NVG_CJK_CHAR)) || type == NVG_CJK_CHAR) {
@@ -2762,27 +2774,52 @@ int nvgTextBreakLines(NVGcontext* ctx, const char* string, const char* end, floa
 
 				// Break to new line when a character is beyond break width.
 				if ((type == NVG_CHAR || type == NVG_CJK_CHAR) && nextWidth > breakRowWidth) {
+					// Width the restarted line (starting at the pending word) would
+					// have once it includes the current glyph.
+					float restartWidth = iter.nextx - wordStartX;
+					// There is no usable break point when no word boundary was seen,
+					// when the recorded break point itself already overflows, or when
+					// restarting the line at the pending word still cannot fit the
+					// current glyph. The last case happens for a Latin run following a
+					// CJK character, whose break point stays behind while the run grows
+					// past the box. In all these cases hard-split before this glyph.
+					int noBreak = (breakEnd == rowStart) || (breakWidth > breakRowWidth) ||
+						(restartWidth > breakRowWidth);
 					// The run length is too long, need to break to new line.
-					if (breakEnd == rowStart) {
-						// The current word is longer than the row length, just break it from here.
-						rows[nrows].start = rowStart;
-						rows[nrows].end = iter.str;
-						rows[nrows].width = rowWidth * invscale;
-						rows[nrows].minx = rowMinX * invscale;
-						rows[nrows].maxx = rowMaxX * invscale;
-						rows[nrows].next = iter.str;
-						nrows++;
-						if (nrows >= maxRows)
-							return nrows;
-						rowStartX = iter.x;
-						rowStart = iter.str;
-						rowEnd = iter.next;
-						rowWidth = iter.nextx - rowStartX;
-						rowMinX = q.x0 - rowStartX;
-						rowMaxX = q.x1 - rowStartX;
-						wordStart = iter.str;
-						wordStartX = iter.x;
-						wordMinX = q.x0 - rowStartX;
+					if (noBreak) {
+						if (prevRowWidth <= 0.0f) {
+							// The row is still empty and even this single glyph does
+							// not fit. It cannot be split any further, so keep it on
+							// the current row instead of emitting an empty row.
+							rowEnd = iter.next;
+							rowWidth = iter.nextx - rowStartX;
+							rowMaxX = q.x1 - rowStartX;
+							wordStart = iter.str;
+							wordStartX = iter.x;
+							wordMinX = q.x0 - rowStartX;
+						} else {
+							// The current word is longer than the row length, break it
+							// right before the current glyph. The emitted row therefore
+							// ends at the previous glyph and never overflows the box.
+							rows[nrows].start = rowStart;
+							rows[nrows].end = iter.str;
+							rows[nrows].width = prevRowWidth * invscale;
+							rows[nrows].minx = rowMinX * invscale;
+							rows[nrows].maxx = prevRowMaxX * invscale;
+							rows[nrows].next = iter.str;
+							nrows++;
+							if (nrows >= maxRows)
+								return nrows;
+							rowStartX = iter.x;
+							rowStart = iter.str;
+							rowEnd = iter.next;
+							rowWidth = iter.nextx - rowStartX;
+							rowMinX = q.x0 - rowStartX;
+							rowMaxX = q.x1 - rowStartX;
+							wordStart = iter.str;
+							wordStartX = iter.x;
+							wordMinX = q.x0 - rowStartX;
+						}
 					} else {
 						// Break the line from the end of the last word, and start new line from the beginning of the new.
 						rows[nrows].start = rowStart;
