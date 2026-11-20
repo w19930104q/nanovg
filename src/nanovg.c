@@ -50,6 +50,14 @@
 #define NVG_MAX_STATES 32
 #endif
 
+// Maximum number of dash pattern lengths stored in the render state.
+#define NVG_MAX_DASHES 16
+
+// Maximum number of dashes a single path is cut into. Patterns that would
+// produce more dashes on a path are far below pixel size and would only
+// exhaust memory, so the path is stroked solid instead.
+#define NVG_MAX_DASH_SEGMENTS 65536
+
 #define NVG_KAPPA90 0.5522847493f	// Length proportional to radius of a cubic bezier handle for 90deg arcs.
 
 #define NVG_COUNTOF(arr) (sizeof(arr) / sizeof(0[arr]))
@@ -80,6 +88,9 @@ struct NVGstate {
 	float miterLimit;
 	int lineJoin;
 	int lineCap;
+	float dashPattern[NVG_MAX_DASHES];
+	int dashCount;
+	float dashPhase;
 	float alpha;
 	float xform[6];
 	NVGscissor scissor;
@@ -111,6 +122,16 @@ struct NVGpathCache {
 	NVGvertex* verts;
 	int nverts;
 	int cverts;
+	// Buffers for dashed stroke expansion (lazily allocated).
+	NVGpoint* dashPoints;
+	int ndashPoints;
+	int cdashPoints;
+	NVGpath* dashPaths;
+	int ndashPaths;
+	int cdashPaths;
+	float* dashIntervals;
+	int ndashIntervals;
+	int cdashIntervals;
 	float bounds[4];
 };
 typedef struct NVGpathCache NVGpathCache;
@@ -173,6 +194,9 @@ static void nvg__deletePathCache(NVGpathCache* c)
 	if (c->points != NULL) free(c->points);
 	if (c->paths != NULL) free(c->paths);
 	if (c->verts != NULL) free(c->verts);
+	if (c->dashPoints != NULL) free(c->dashPoints);
+	if (c->dashPaths != NULL) free(c->dashPaths);
+	if (c->dashIntervals != NULL) free(c->dashIntervals);
 	free(c);
 }
 
@@ -700,6 +724,50 @@ void nvgLineJoin(NVGcontext* ctx, int join)
 {
 	NVGstate* state = nvg__getState(ctx);
 	state->lineJoin = join;
+}
+
+void nvgDashPattern(NVGcontext* ctx, const float* pattern, int count)
+{
+	NVGstate* state = nvg__getState(ctx);
+	float sum = 0.0f;
+	int i, n = 0;
+
+	if (pattern == NULL || count <= 0) {
+		state->dashCount = 0;
+		return;
+	}
+
+	// Copy and sanitize: negative and NaN lengths are clamped to zero.
+	for (i = 0; i < count && n < NVG_MAX_DASHES; i++) {
+		float v = pattern[i];
+		if (!(v > 0.0f)) v = 0.0f;
+		state->dashPattern[n++] = v;
+		sum += v;
+	}
+
+	// An odd number of lengths is duplicated (SVG/Canvas semantics) so that
+	// dashes and gaps keep alternating when the pattern repeats.
+	if ((n & 1) != 0) {
+		if (2*n <= NVG_MAX_DASHES) {
+			for (i = 0; i < n; i++)
+				state->dashPattern[n+i] = state->dashPattern[i];
+			n *= 2;
+		} else {
+			n--;	// No room to duplicate, drop the last length to stay even.
+		}
+	}
+
+	// A pattern that sums to (nearly) zero is treated as solid.
+	if (sum < 1e-6f)
+		n = 0;
+
+	state->dashCount = n;
+}
+
+void nvgDashPhase(NVGcontext* ctx, float phase)
+{
+	NVGstate* state = nvg__getState(ctx);
+	state->dashPhase = phase;
 }
 
 void nvgGlobalAlpha(NVGcontext* ctx, float alpha)
@@ -1727,6 +1795,308 @@ static void nvg__calculateJoins(NVGcontext* ctx, float w, int lineJoin, float mi
 }
 
 
+// Dashed stroke support.
+//
+// Dashing is implemented by cutting the flattened paths into sub-paths along
+// the "on" intervals of the dash pattern, and stroking each sub-path with the
+// regular stroke expansion. This way each dash gets the current line cap at
+// its ends and the current line join at its interior corners, exactly as if
+// the dashes were drawn as separate solid paths. The dashed sub-paths are
+// built into separate buffers (cache->dashPoints/dashPaths) which are swapped
+// into the cache for the duration of the stroke expansion, leaving the
+// original paths untouched.
+
+struct NVGdashCursor {
+	NVGpoint* pts;		// Points of the source path.
+	int n;				// Number of points in the source path.
+	int nseg;			// Number of segments (n for closed, n-1 for open paths).
+	int segIdx;			// Segment the cursor is currently on.
+	float segStart;		// Arc position of the start of the current segment.
+};
+
+static void nvg__dashReset(NVGcontext* ctx)
+{
+	ctx->cache->ndashPoints = 0;
+	ctx->cache->ndashPaths = 0;
+}
+
+static NVGpath* nvg__beginDashPath(NVGcontext* ctx)
+{
+	NVGpathCache* cache = ctx->cache;
+	NVGpath* path;
+	if (cache->ndashPaths+1 > cache->cdashPaths) {
+		NVGpath* paths;
+		int cpaths = cache->cdashPaths > 0 ? cache->ndashPaths+1 + cache->cdashPaths/2 : NVG_INIT_PATHS_SIZE;
+		paths = (NVGpath*)realloc(cache->dashPaths, sizeof(NVGpath)*cpaths);
+		if (paths == NULL) return NULL;
+		cache->dashPaths = paths;
+		cache->cdashPaths = cpaths;
+	}
+	path = &cache->dashPaths[cache->ndashPaths];
+	memset(path, 0, sizeof(*path));
+	path->first = cache->ndashPoints;
+	path->winding = NVG_CCW;
+	cache->ndashPaths++;
+	return path;
+}
+
+static void nvg__dashAppendPoint(NVGcontext* ctx, float x, float y, int flags)
+{
+	NVGpathCache* cache = ctx->cache;
+	NVGpath* path;
+	NVGpoint* pt;
+	if (cache->ndashPaths == 0) return;
+	path = &cache->dashPaths[cache->ndashPaths-1];
+
+	// Merge with the previous point if too close, same as nvg__addPoint().
+	if (path->count > 0) {
+		pt = &cache->dashPoints[cache->ndashPoints-1];
+		if (nvg__ptEquals(pt->x,pt->y, x,y, ctx->distTol)) {
+			pt->flags |= (unsigned char)flags;
+			return;
+		}
+	}
+
+	if (cache->ndashPoints+1 > cache->cdashPoints) {
+		NVGpoint* points;
+		int cpoints = cache->cdashPoints > 0 ? cache->ndashPoints+1 + cache->cdashPoints/2 : NVG_INIT_POINTS_SIZE;
+		points = (NVGpoint*)realloc(cache->dashPoints, sizeof(NVGpoint)*cpoints);
+		if (points == NULL) return;
+		cache->dashPoints = points;
+		cache->cdashPoints = cpoints;
+	}
+
+	pt = &cache->dashPoints[cache->ndashPoints];
+	memset(pt, 0, sizeof(*pt));
+	pt->x = x;
+	pt->y = y;
+	pt->flags = (unsigned char)flags;
+
+	cache->ndashPoints++;
+	path->count++;
+}
+
+static void nvg__endDashPath(NVGcontext* ctx, float span)
+{
+	NVGpathCache* cache = ctx->cache;
+	NVGpath* path;
+	if (cache->ndashPaths == 0) return;
+	path = &cache->dashPaths[cache->ndashPaths-1];
+	// Drop degenerate dashes: a dash with less than two distinct points or
+	// with sub-tolerance arc length would produce broken stroke geometry.
+	if (path->count < 2 || span < ctx->distTol) {
+		cache->ndashPoints = path->first;
+		cache->ndashPaths--;
+	}
+}
+
+static int nvg__dashPushInterval(NVGcontext* ctx, float start, float end)
+{
+	NVGpathCache* cache = ctx->cache;
+	if (cache->ndashIntervals+2 > cache->cdashIntervals) {
+		float* intervals;
+		int cintervals = cache->cdashIntervals > 0 ? cache->ndashIntervals+2 + cache->cdashIntervals/2 : 64;
+		intervals = (float*)realloc(cache->dashIntervals, sizeof(float)*cintervals);
+		if (intervals == NULL) return 0;
+		cache->dashIntervals = intervals;
+		cache->cdashIntervals = cintervals;
+	}
+	cache->dashIntervals[cache->ndashIntervals++] = start;
+	cache->dashIntervals[cache->ndashIntervals++] = end;
+	return 1;
+}
+
+// Moves the cursor forward to the given arc position, appending the source
+// path points that are passed along the way when emit != 0. Positions may
+// exceed the path length for closed paths (the cursor wraps around the loop).
+static void nvg__dashAdvance(NVGcontext* ctx, struct NVGdashCursor* cur, float pos, float tol, int emit)
+{
+	NVGpoint* pts = cur->pts;
+	for (;;) {
+		float segEnd = cur->segStart + pts[cur->segIdx].len;
+		if (segEnd > pos - tol) break;
+		if (emit) {
+			NVGpoint* bp = &pts[(cur->segIdx+1) % cur->n];
+			nvg__dashAppendPoint(ctx, bp->x, bp->y, bp->flags);
+		}
+		cur->segStart = segEnd;
+		cur->segIdx++;
+		if (cur->segIdx >= cur->nseg)
+			cur->segIdx = 0;	// Can only happen for closed paths.
+	}
+}
+
+// Returns the point on the source path at the cursor's current arc position.
+static void nvg__dashPointAt(struct NVGdashCursor* cur, float pos, float* x, float* y)
+{
+	NVGpoint* seg = &cur->pts[cur->segIdx];
+	float t = pos - cur->segStart;
+	t = nvg__clampf(t, 0.0f, seg->len);
+	*x = seg->x + seg->dx * t;
+	*y = seg->y + seg->dy * t;
+}
+
+// Copies a source path into the dash buffers unchanged (solid fallback).
+static void nvg__dashCopyPath(NVGcontext* ctx, NVGpoint* pts, int n, int closed)
+{
+	int i;
+	if (nvg__beginDashPath(ctx) == NULL) return;
+	for (i = 0; i < n; i++)
+		nvg__dashAppendPoint(ctx, pts[i].x, pts[i].y, pts[i].flags);
+	ctx->cache->dashPaths[ctx->cache->ndashPaths-1].closed = (unsigned char)closed;
+}
+
+// Cuts one source path into dash sub-paths, appended to the dash buffers.
+static void nvg__dashPath(NVGcontext* ctx, NVGpath* srcPath, const float* pattern, int count, float phase, float patternSum)
+{
+	NVGpathCache* cache = ctx->cache;
+	NVGpoint* pts = &cache->points[srcPath->first];
+	int n = srcPath->count;
+	int closed = srcPath->closed;
+	int nseg = closed ? n : n-1;
+	float tol = ctx->distTol;
+	float L = 0.0f, p, rem, c, elemEnd, istart = 0.0f;
+	int i, idx, recording = 0, ni;
+	struct NVGdashCursor cur;
+	float px, py;
+
+	if (nseg < 1) return;
+	for (i = 0; i < nseg; i++)
+		L += pts[i].len;
+	if (L < tol) return;
+
+	// Guard against pathological patterns: if the pattern would be cut into
+	// an excessive number of dashes on this path, the dashes are far below
+	// pixel size; stroke the path solid instead of exhausting memory.
+	if (L / patternSum * (float)count > (float)NVG_MAX_DASH_SEGMENTS) {
+		nvg__dashCopyPath(ctx, pts, n, closed);
+		return;
+	}
+
+	// Normalize the phase into [0, patternSum) and find the pattern element
+	// containing arc position 0. Even pattern indices are dashes (on), odd
+	// indices are gaps (off).
+	p = nvg__modf(phase, patternSum);
+	if (p < 0.0f) p += patternSum;
+	idx = 0;
+	while (p >= pattern[idx]) {
+		p -= pattern[idx];
+		idx = (idx+1) % count;
+	}
+	rem = pattern[idx] - p;
+
+	// Walk the pattern along the path and record the on-intervals.
+	cache->ndashIntervals = 0;
+	c = 0.0f;
+	while (c < L - 1e-6f) {
+		if (rem < 1e-6f) {	// Skip zero-length pattern elements.
+			idx = (idx+1) % count;
+			rem = pattern[idx];
+			continue;
+		}
+		elemEnd = nvg__minf(c + rem, L);
+		if ((idx & 1) == 0) {
+			if (!recording) { istart = c; recording = 1; }
+		} else {
+			if (recording) {
+				nvg__dashPushInterval(ctx, istart, c);
+				recording = 0;
+			}
+		}
+		c = elemEnd;
+		idx = (idx+1) % count;
+		rem = pattern[idx];
+	}
+	if (recording)
+		nvg__dashPushInterval(ctx, istart, L);
+
+	// Drop intervals too short to render and merge adjacent ones (these can
+	// result from zero-length gaps in the pattern).
+	ni = 0;
+	for (i = 0; i < cache->ndashIntervals; i += 2) {
+		float s = cache->dashIntervals[i];
+		float e = cache->dashIntervals[i+1];
+		if (e - s < tol) continue;
+		if (ni > 0 && s - cache->dashIntervals[ni-1] <= tol) {
+			cache->dashIntervals[ni-1] = e;
+		} else {
+			cache->dashIntervals[ni++] = s;
+			cache->dashIntervals[ni++] = e;
+		}
+	}
+	cache->ndashIntervals = ni;
+	ni /= 2;
+	if (ni == 0) return;
+
+	if (closed && ni == 1 &&
+		cache->dashIntervals[0] <= tol &&
+		cache->dashIntervals[1] >= L - tol) {
+		// The whole closed path is covered by a single dash: keep it closed
+		// so the seam is rendered as a join instead of two caps.
+		nvg__dashCopyPath(ctx, pts, n, 1);
+		return;
+	}
+
+	if (closed && ni >= 2 &&
+		cache->dashIntervals[0] <= tol &&
+		cache->dashIntervals[cache->ndashIntervals-1] >= L - tol) {
+		// The pattern is "on" on both sides of the start/end point: join the
+		// first and last dash into one continuous dash across the seam. The
+		// merged interval may extend past L, the emitter wraps around the loop.
+		cache->dashIntervals[cache->ndashIntervals-1] = L + cache->dashIntervals[1];
+		memmove(&cache->dashIntervals[0], &cache->dashIntervals[2], (ni-1)*2*sizeof(float));
+		cache->ndashIntervals -= 2;
+		ni--;
+	}
+
+	// Emit the dash sub-paths.
+	cur.pts = pts;
+	cur.n = n;
+	cur.nseg = nseg;
+	cur.segIdx = 0;
+	cur.segStart = 0.0f;
+	for (i = 0; i < cache->ndashIntervals; i += 2) {
+		float s = cache->dashIntervals[i];
+		float e = cache->dashIntervals[i+1];
+		nvg__dashAdvance(ctx, &cur, s, tol, 0);
+		if (nvg__beginDashPath(ctx) == NULL) return;
+		nvg__dashPointAt(&cur, s, &px, &py);
+		nvg__dashAppendPoint(ctx, px, py, NVG_PT_CORNER);
+		nvg__dashAdvance(ctx, &cur, e, tol, 1);
+		nvg__dashPointAt(&cur, e, &px, &py);
+		nvg__dashAppendPoint(ctx, px, py, NVG_PT_CORNER);
+		nvg__endDashPath(ctx, e - s);
+	}
+}
+
+// Builds the dashed version of the flattened paths into the dash buffers.
+// Returns 1 if the dash buffers should be used for stroking, 0 if the paths
+// should be stroked solid (degenerate pattern).
+static int nvg__dashPaths(NVGcontext* ctx, const float* pattern, int count, float phase)
+{
+	NVGpathCache* cache = ctx->cache;
+	float patternSum = 0.0f;
+	int i;
+
+	for (i = 0; i < count; i++)
+		patternSum += pattern[i];
+	// A pattern with (nearly) zero total length cannot produce visible
+	// dashes; treat it as solid.
+	if (patternSum < 1e-4f)
+		return 0;
+	// Guard against NaN/inf phase.
+	if (!(phase == phase) || phase > 1e30f || phase < -1e30f)
+		phase = 0.0f;
+
+	nvg__dashReset(ctx);
+
+	for (i = 0; i < cache->npaths; i++)
+		nvg__dashPath(ctx, &cache->paths[i], pattern, count, phase, patternSum);
+
+	return 1;
+}
+
+
 static int nvg__expandStroke(NVGcontext* ctx, float w, float fringe, int lineCap, int lineJoin, float miterLimit)
 {
 	NVGpathCache* cache = ctx->cache;
@@ -2261,7 +2631,11 @@ void nvgStroke(NVGcontext* ctx)
 	float scale = nvg__getAverageScale(state->xform);
 	float strokeWidth = nvg__clampf(state->strokeWidth * scale, 0.0f, 200.0f);
 	NVGpaint strokePaint = state->stroke;
+	NVGpathCache* cache = ctx->cache;
 	const NVGpath* path;
+	NVGpoint* savedPoints = NULL;
+	NVGpath* savedPaths = NULL;
+	int savedNPoints = 0, savedNPaths = 0;
 	int i;
 
 
@@ -2280,6 +2654,21 @@ void nvgStroke(NVGcontext* ctx)
 
 	nvg__flattenPaths(ctx);
 
+	// Cut the paths into dashes if a dash pattern is set. The dashed
+	// sub-paths are swapped into the cache for the stroke expansion, so the
+	// existing cap/join geometry is applied to each dash.
+	if (state->dashCount > 0) {
+		float dashPattern[NVG_MAX_DASHES];
+		for (i = 0; i < state->dashCount; i++)
+			dashPattern[i] = state->dashPattern[i] * scale;
+		if (nvg__dashPaths(ctx, dashPattern, state->dashCount, state->dashPhase * scale)) {
+			savedPoints = cache->points; savedNPoints = cache->npoints;
+			savedPaths = cache->paths; savedNPaths = cache->npaths;
+			cache->points = cache->dashPoints; cache->npoints = cache->ndashPoints;
+			cache->paths = cache->dashPaths; cache->npaths = cache->ndashPaths;
+		}
+	}
+
 	if (ctx->params.edgeAntiAlias && state->shapeAntiAlias)
 		nvg__expandStroke(ctx, strokeWidth*0.5f, ctx->fringeWidth, state->lineCap, state->lineJoin, state->miterLimit);
 	else
@@ -2293,6 +2682,12 @@ void nvgStroke(NVGcontext* ctx)
 		path = &ctx->cache->paths[i];
 		ctx->strokeTriCount += path->nstroke-2;
 		ctx->drawCallCount++;
+	}
+
+	// Restore the original (undashed) paths if they were swapped out.
+	if (savedPaths != NULL) {
+		cache->points = savedPoints; cache->npoints = savedNPoints;
+		cache->paths = savedPaths; cache->npaths = savedNPaths;
 	}
 }
 

@@ -268,6 +268,26 @@ void nvgLineCap(NVGcontext* ctx, int cap);
 // Can be one of NVG_MITER (default), NVG_ROUND, NVG_BEVEL.
 void nvgLineJoin(NVGcontext* ctx, int join);
 
+// Sets the dash pattern used to stroke paths.
+// The pattern is an array of alternating dash (on) and gap (off) lengths,
+// specified in local coordinates (they are scaled by the average scale of the
+// current transform, same as the stroke width). For example, pattern {8, 4}
+// draws 8 unit dashes separated by 4 unit gaps. An odd number of lengths is
+// duplicated so that dashes and gaps alternate when the pattern repeats,
+// e.g. {4, 2, 1} is treated as {4, 2, 1, 4, 2, 1}. At most 16 lengths are
+// stored. Negative lengths are clamped to zero.
+// Each dash is stroked with the current line cap, and corners inside a dash
+// use the current line join. On closed paths the dash pattern wraps around
+// the start/end point: if the pattern is "on" on both sides of the seam, the
+// first and last dash are joined into one continuous dash.
+// Passing NULL or count <= 0 disables dashing and restores solid strokes
+// (the default). A pattern whose lengths sum to zero also disables dashing.
+void nvgDashPattern(NVGcontext* ctx, const float* pattern, int count);
+
+// Sets the distance into the dash pattern at which stroking starts,
+// in local coordinates. Defaults to 0. Useful for animating dashes.
+void nvgDashPhase(NVGcontext* ctx, float phase);
+
 // Sets the transparency applied to all rendered shapes.
 // Already transparent paths will get proportionally more transparent as well.
 void nvgGlobalAlpha(NVGcontext* ctx, float alpha);
