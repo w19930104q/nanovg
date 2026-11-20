@@ -391,6 +391,21 @@ void nvgBeginFrame(NVGcontext* ctx, float windowWidth, float windowHeight, float
 
 void nvgCancelFrame(NVGcontext* ctx)
 {
+	// Roll back all per-frame state so nothing drawn this frame (shapes or
+	// text) leaks into the next frame, mirroring the reset nvgBeginFrame does.
+	ctx->nstates = 0;
+	nvgSave(ctx);
+	nvgReset(ctx);
+
+	ctx->ncommands = 0;
+	ctx->cache->npoints = 0;
+	ctx->cache->npaths = 0;
+
+	ctx->drawCallCount = 0;
+	ctx->fillTriCount = 0;
+	ctx->strokeTriCount = 0;
+	ctx->textTriCount = 0;
+
 	ctx->params.renderCancel(ctx->params.userPtr);
 }
 
