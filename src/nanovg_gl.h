@@ -115,6 +115,9 @@ enum NVGimageFlagsGL {
 
 enum GLNVGuniformLoc {
 	GLNVG_LOC_VIEWSIZE,
+#if defined NANOVG_GLES2
+	GLNVG_LOC_VIEWORIGIN,
+#endif
 	GLNVG_LOC_TEX,
 	GLNVG_LOC_FRAG,
 	GLNVG_MAX_LOCS
@@ -176,6 +179,11 @@ struct GLNVGcall {
 	int triangleCount;
 	int uniformOffset;
 	GLNVGblend blendFunc;
+	// Local origin used to rebase fragment-shader coordinates for this draw
+	// call (GLES2 only, see glnvg__rebaseInverseXform). Zero for other backends.
+	float origin[2];
+	// Bounding radius of the draw call geometry around its origin (GLES2 only).
+	float boundRadius;
 };
 typedef struct GLNVGcall GLNVGcall;
 
@@ -232,6 +240,9 @@ struct GLNVGcontext {
 	GLNVGshader shader;
 	GLNVGtexture* textures;
 	float view[2];
+#if defined NANOVG_GLES2
+	int fragHighp;	// nonzero if the fragment shader supports highp floats
+#endif
 	int ntextures;
 	int ctextures;
 	int textureId;
@@ -493,6 +504,9 @@ static void glnvg__deleteShader(GLNVGshader* shader)
 static void glnvg__getUniforms(GLNVGshader* shader)
 {
 	shader->loc[GLNVG_LOC_VIEWSIZE] = glGetUniformLocation(shader->prog, "viewSize");
+#if defined NANOVG_GLES2
+	shader->loc[GLNVG_LOC_VIEWORIGIN] = glGetUniformLocation(shader->prog, "viewOrigin");
+#endif
 	shader->loc[GLNVG_LOC_TEX] = glGetUniformLocation(shader->prog, "tex");
 
 #if NANOVG_GL_USE_UNIFORMBUFFER
@@ -509,7 +523,13 @@ static int glnvg__renderCreate(void* uptr)
 	GLNVGcontext* gl = (GLNVGcontext*)uptr;
 	int align = 4;
 
-	// TODO: mediump float may not be enough for GLES2 in iOS.
+	// On GLES2 the fragment shader may only have mediump (fp16) floats, which
+	// cannot represent large absolute framebuffer coordinates: positions jitter
+	// and shapes drift, growing worse the farther content is from the origin.
+	// To keep the fragment math in small magnitudes, each draw call is rebased
+	// around a local origin: the vertex shader emits origin-relative positions
+	// (NANOVG_REBASE) and the inverse scissor/paint transforms uploaded per
+	// draw call are adjusted to match (see glnvg__rebaseInverseXform).
 	// see the following discussion: https://github.com/memononen/nanovg/issues/46
 	static const char* shaderHeader =
 #if defined NANOVG_GL2
@@ -520,6 +540,7 @@ static int glnvg__renderCreate(void* uptr)
 #elif defined NANOVG_GLES2
 		"#version 100\n"
 		"#define NANOVG_GL2 1\n"
+		"#define NANOVG_REBASE 1\n"
 #elif defined NANOVG_GLES3
 		"#version 300 es\n"
 		"#define NANOVG_GL3 1\n"
@@ -541,6 +562,9 @@ static int glnvg__renderCreate(void* uptr)
 		"	out vec2 fpos;\n"
 		"#else\n"
 		"	uniform vec2 viewSize;\n"
+		"#ifdef NANOVG_REBASE\n"
+		"	uniform vec2 viewOrigin;\n"
+		"#endif\n"
 		"	attribute vec2 vertex;\n"
 		"	attribute vec2 tcoord;\n"
 		"	varying vec2 ftcoord;\n"
@@ -548,7 +572,11 @@ static int glnvg__renderCreate(void* uptr)
 		"#endif\n"
 		"void main(void) {\n"
 		"	ftcoord = tcoord;\n"
+		"#ifdef NANOVG_REBASE\n"
+		"	fpos = vertex - viewOrigin;\n"
+		"#else\n"
 		"	fpos = vertex;\n"
+		"#endif\n"
 		"	gl_Position = vec4(2.0*vertex.x/viewSize.x - 1.0, 1.0 - 2.0*vertex.y/viewSize.y, 0, 1);\n"
 		"}\n";
 
@@ -689,6 +717,20 @@ static int glnvg__renderCreate(void* uptr)
 
 	glnvg__checkError(gl, "uniform locations");
 	glnvg__getUniforms(&gl->shader);
+
+#if defined NANOVG_GLES2
+	// Check whether the fragment shader can use highp floats. If it cannot
+	// (GL_FRAGMENT_PRECISION_HIGH undefined, mediump only), large absolute
+	// coordinates lose precision, so draw calls are rebased around a local
+	// origin (see glnvg__rebaseInverseXform). When highp is available the
+	// origin stays (0,0) and rendering is identical to the non-rebased path.
+	{
+		GLint range[2] = { 0, 0 };
+		GLint precision = 0;
+		glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &precision);
+		gl->fragHighp = (range[0] != 0 || range[1] != 0 || precision != 0) ? 1 : 0;
+	}
+#endif
 
 	// Create dynamic vertex array
 #if defined NANOVG_GL3
@@ -906,11 +948,54 @@ static NVGcolor glnvg__premulColor(NVGcolor c)
 	return c;
 }
 
+#if defined NANOVG_GLES2
+// Rebase an inverse transform so it can be evaluated against origin-relative
+// coordinates: rebase(M) * (p - origin) == M * p. Moving the large absolute
+// offset out of the translation column keeps the values that reach the
+// (possibly mediump) fragment shader small.
+static void glnvg__rebaseInverseXform(float* invxform, const float* origin)
+{
+	invxform[4] += invxform[0]*origin[0] + invxform[2]*origin[1];
+	invxform[5] += invxform[1]*origin[0] + invxform[3]*origin[1];
+}
+
+// Set the draw call's local origin to the center of the bounding box of the
+// given vertex range, keeping origin-relative fragment coordinates as small
+// as possible for this draw call. Also records the bounding radius, used to
+// keep the paint space within mediump range (see glnvg__convertPaint).
+static void glnvg__originFromVerts(GLNVGcontext* gl, GLNVGcall* call, int start, int count)
+{
+	float minx, miny, maxx, maxy, w, h;
+	int i;
+	if (count <= 0) return;
+	minx = maxx = gl->verts[start].x;
+	miny = maxy = gl->verts[start].y;
+	for (i = 1; i < count; i++) {
+		const NVGvertex* v = &gl->verts[start + i];
+		if (v->x < minx) minx = v->x;
+		if (v->x > maxx) maxx = v->x;
+		if (v->y < miny) miny = v->y;
+		if (v->y > maxy) maxy = v->y;
+	}
+	call->origin[0] = (minx + maxx) * 0.5f;
+	call->origin[1] = (miny + maxy) * 0.5f;
+	w = maxx - minx;
+	h = maxy - miny;
+	call->boundRadius = 0.5f*sqrtf(w*w + h*h);
+}
+#endif
+
 static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpaint* paint,
-							   NVGscissor* scissor, float width, float fringe, float strokeThr)
+							   NVGscissor* scissor, float width, float fringe, float strokeThr,
+							   const float* origin, float boundRadius)
 {
 	GLNVGtexture* tex = NULL;
 	float invxform[6];
+
+#if !defined NANOVG_GLES2
+	NVG_NOTUSED(origin);
+	NVG_NOTUSED(boundRadius);
+#endif
 
 	memset(frag, 0, sizeof(*frag));
 
@@ -925,6 +1010,9 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 		frag->scissorScale[1] = 1.0f;
 	} else {
 		nvgTransformInverse(invxform, scissor->xform);
+#if defined NANOVG_GLES2
+		glnvg__rebaseInverseXform(invxform, origin);
+#endif
 		glnvg__xformToMat3x4(frag->scissorMat, invxform);
 		frag->scissorExt[0] = scissor->extent[0];
 		frag->scissorExt[1] = scissor->extent[1];
@@ -972,6 +1060,31 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 		nvgTransformInverse(invxform, paint->xform);
 	}
 
+#if defined NANOVG_GLES2
+	glnvg__rebaseInverseXform(invxform, origin);
+	if (gl->fragHighp == 0) {
+		// mediump (fp16) tops out at 65504 and sdroundrect() squares its
+		// input, so large paint spaces overflow: linear gradients use a
+		// 1e5-sized box, and big shapes exceed the range in length(). Both
+		// sdroundrect() and the pt/extent texture lookup are homogeneous,
+		// so scaling the whole paint space down leaves the shader result
+		// unchanged. Use a power of two so the scaling is exact.
+		float maxMag = fabsf(invxform[4]) + fabsf(invxform[5])
+			+ (fabsf(invxform[0]) + fabsf(invxform[2])) * boundRadius
+			+ (fabsf(invxform[1]) + fabsf(invxform[3])) * boundRadius
+			+ fabsf(frag->extent[0]) + fabsf(frag->extent[1]) + fabsf(frag->radius);
+		float scale = 1.0f;
+		while (maxMag * scale > 128.0f) scale *= 0.5f;
+		if (scale != 1.0f) {
+			int i;
+			for (i = 0; i < 6; i++) invxform[i] *= scale;
+			frag->extent[0] *= scale;
+			frag->extent[1] *= scale;
+			frag->radius *= scale;
+			frag->feather *= scale;
+		}
+	}
+#endif
 	glnvg__xformToMat3x4(frag->paintMat, invxform);
 
 	return 1;
@@ -979,14 +1092,22 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 
 static GLNVGfragUniforms* nvg__fragUniformPtr(GLNVGcontext* gl, int i);
 
-static void glnvg__setUniforms(GLNVGcontext* gl, int uniformOffset, int image)
+static void glnvg__setUniforms(GLNVGcontext* gl, int uniformOffset, int image, const float* origin)
 {
 	GLNVGtexture* tex = NULL;
+#if !defined NANOVG_GLES2
+	NVG_NOTUSED(origin);
+#endif
 #if NANOVG_GL_USE_UNIFORMBUFFER
 	glBindBufferRange(GL_UNIFORM_BUFFER, GLNVG_FRAG_BINDING, gl->fragBuf, uniformOffset, sizeof(GLNVGfragUniforms));
 #else
 	GLNVGfragUniforms* frag = nvg__fragUniformPtr(gl, uniformOffset);
 	glUniform4fv(gl->shader.loc[GLNVG_LOC_FRAG], NANOVG_GL_UNIFORMARRAY_SIZE, &(frag->uniformArray[0][0]));
+#endif
+
+#if defined NANOVG_GLES2
+	// Per-draw-call local origin, matches the rebased inverse transforms.
+	glUniform2fv(gl->shader.loc[GLNVG_LOC_VIEWORIGIN], 1, origin);
 #endif
 
 	if (image != 0) {
@@ -1020,7 +1141,7 @@ static void glnvg__fill(GLNVGcontext* gl, GLNVGcall* call)
 	glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
 	// set bindpoint for solid loc
-	glnvg__setUniforms(gl, call->uniformOffset, 0);
+	glnvg__setUniforms(gl, call->uniformOffset, 0, call->origin);
 	glnvg__checkError(gl, "fill simple");
 
 	glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
@@ -1033,7 +1154,7 @@ static void glnvg__fill(GLNVGcontext* gl, GLNVGcall* call)
 	// Draw anti-aliased pixels
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-	glnvg__setUniforms(gl, call->uniformOffset + gl->fragSize, call->image);
+	glnvg__setUniforms(gl, call->uniformOffset + gl->fragSize, call->image, call->origin);
 	glnvg__checkError(gl, "fill fill");
 
 	if (gl->flags & NVG_ANTIALIAS) {
@@ -1057,7 +1178,7 @@ static void glnvg__convexFill(GLNVGcontext* gl, GLNVGcall* call)
 	GLNVGpath* paths = &gl->paths[call->pathOffset];
 	int i, npaths = call->pathCount;
 
-	glnvg__setUniforms(gl, call->uniformOffset, call->image);
+	glnvg__setUniforms(gl, call->uniformOffset, call->image, call->origin);
 	glnvg__checkError(gl, "convex fill");
 
 	for (i = 0; i < npaths; i++) {
@@ -1082,13 +1203,13 @@ static void glnvg__stroke(GLNVGcontext* gl, GLNVGcall* call)
 		// Fill the stroke base without overlap
 		glnvg__stencilFunc(gl, GL_EQUAL, 0x0, 0xff);
 		glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
-		glnvg__setUniforms(gl, call->uniformOffset + gl->fragSize, call->image);
+		glnvg__setUniforms(gl, call->uniformOffset + gl->fragSize, call->image, call->origin);
 		glnvg__checkError(gl, "stroke fill 0");
 		for (i = 0; i < npaths; i++)
 			glDrawArrays(GL_TRIANGLE_STRIP, paths[i].strokeOffset, paths[i].strokeCount);
 
 		// Draw anti-aliased pixels.
-		glnvg__setUniforms(gl, call->uniformOffset, call->image);
+		glnvg__setUniforms(gl, call->uniformOffset, call->image, call->origin);
 		glnvg__stencilFunc(gl, GL_EQUAL, 0x00, 0xff);
 		glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 		for (i = 0; i < npaths; i++)
@@ -1105,10 +1226,10 @@ static void glnvg__stroke(GLNVGcontext* gl, GLNVGcall* call)
 
 		glDisable(GL_STENCIL_TEST);
 
-//		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, strokeWidth, fringe, 1.0f - 0.5f/255.0f);
+//		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, strokeWidth, fringe, 1.0f - 0.5f/255.0f, call->origin, call->boundRadius);
 
 	} else {
-		glnvg__setUniforms(gl, call->uniformOffset, call->image);
+		glnvg__setUniforms(gl, call->uniformOffset, call->image, call->origin);
 		glnvg__checkError(gl, "stroke fill");
 		// Draw Strokes
 		for (i = 0; i < npaths; i++)
@@ -1118,7 +1239,7 @@ static void glnvg__stroke(GLNVGcontext* gl, GLNVGcall* call)
 
 static void glnvg__triangles(GLNVGcontext* gl, GLNVGcall* call)
 {
-	glnvg__setUniforms(gl, call->uniformOffset, call->image);
+	glnvg__setUniforms(gl, call->uniformOffset, call->image, call->origin);
 	glnvg__checkError(gl, "triangles fill");
 
 	glDrawArrays(GL_TRIANGLES, call->triangleOffset, call->triangleCount);
@@ -1372,6 +1493,18 @@ static void glnvg__renderFill(void* uptr, NVGpaint* paint, NVGcompositeOperation
 	call->image = paint->image;
 	call->blendFunc = glnvg__blendCompositeOperation(compositeOperation);
 
+#if defined NANOVG_GLES2
+	// Rebase the draw call around the center of its bounds so that the
+	// fragment shader works with small, origin-relative coordinates.
+	if (gl->fragHighp == 0) {
+		float bw = bounds[2] - bounds[0];
+		float bh = bounds[3] - bounds[1];
+		call->origin[0] = (bounds[0] + bounds[2]) * 0.5f;
+		call->origin[1] = (bounds[1] + bounds[3]) * 0.5f;
+		call->boundRadius = 0.5f*sqrtf(bw*bw + bh*bh) + fringe;
+	}
+#endif
+
 	if (npaths == 1 && paths[0].convex)
 	{
 		call->type = GLNVG_CONVEXFILL;
@@ -1419,12 +1552,12 @@ static void glnvg__renderFill(void* uptr, NVGpaint* paint, NVGcompositeOperation
 		frag->strokeThr = -1.0f;
 		frag->type = NSVG_SHADER_SIMPLE;
 		// Fill shader
-		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, fringe, fringe, -1.0f);
+		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, fringe, fringe, -1.0f, call->origin, call->boundRadius);
 	} else {
 		call->uniformOffset = glnvg__allocFragUniforms(gl, 1);
 		if (call->uniformOffset == -1) goto error;
 		// Fill shader
-		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, fringe, fringe, -1.0f);
+		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, fringe, fringe, -1.0f, call->origin, call->boundRadius);
 	}
 
 	return;
@@ -1441,6 +1574,9 @@ static void glnvg__renderStroke(void* uptr, NVGpaint* paint, NVGcompositeOperati
 	GLNVGcontext* gl = (GLNVGcontext*)uptr;
 	GLNVGcall* call = glnvg__allocCall(gl);
 	int i, maxverts, offset;
+#if defined NANOVG_GLES2
+	int vstart;
+#endif
 
 	if (call == NULL) return;
 
@@ -1455,6 +1591,9 @@ static void glnvg__renderStroke(void* uptr, NVGpaint* paint, NVGcompositeOperati
 	maxverts = glnvg__maxVertCount(paths, npaths);
 	offset = glnvg__allocVerts(gl, maxverts);
 	if (offset == -1) goto error;
+#if defined NANOVG_GLES2
+	vstart = offset;
+#endif
 
 	for (i = 0; i < npaths; i++) {
 		GLNVGpath* copy = &gl->paths[call->pathOffset + i];
@@ -1468,19 +1607,25 @@ static void glnvg__renderStroke(void* uptr, NVGpaint* paint, NVGcompositeOperati
 		}
 	}
 
+#if defined NANOVG_GLES2
+	// Rebase the draw call around the center of its stroke geometry.
+	if (gl->fragHighp == 0)
+		glnvg__originFromVerts(gl, call, vstart, offset - vstart);
+#endif
+
 	if (gl->flags & NVG_STENCIL_STROKES) {
 		// Fill shader
 		call->uniformOffset = glnvg__allocFragUniforms(gl, 2);
 		if (call->uniformOffset == -1) goto error;
 
-		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, strokeWidth, fringe, -1.0f);
-		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, strokeWidth, fringe, 1.0f - 0.5f/255.0f);
+		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, strokeWidth, fringe, -1.0f, call->origin, call->boundRadius);
+		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset + gl->fragSize), paint, scissor, strokeWidth, fringe, 1.0f - 0.5f/255.0f, call->origin, call->boundRadius);
 
 	} else {
 		// Fill shader
 		call->uniformOffset = glnvg__allocFragUniforms(gl, 1);
 		if (call->uniformOffset == -1) goto error;
-		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, strokeWidth, fringe, -1.0f);
+		glnvg__convertPaint(gl, nvg__fragUniformPtr(gl, call->uniformOffset), paint, scissor, strokeWidth, fringe, -1.0f, call->origin, call->boundRadius);
 	}
 
 	return;
@@ -1511,11 +1656,17 @@ static void glnvg__renderTriangles(void* uptr, NVGpaint* paint, NVGcompositeOper
 
 	memcpy(&gl->verts[call->triangleOffset], verts, sizeof(NVGvertex) * nverts);
 
+#if defined NANOVG_GLES2
+	// Rebase the draw call around the center of its triangle geometry.
+	if (gl->fragHighp == 0)
+		glnvg__originFromVerts(gl, call, call->triangleOffset, nverts);
+#endif
+
 	// Fill shader
 	call->uniformOffset = glnvg__allocFragUniforms(gl, 1);
 	if (call->uniformOffset == -1) goto error;
 	frag = nvg__fragUniformPtr(gl, call->uniformOffset);
-	glnvg__convertPaint(gl, frag, paint, scissor, 1.0f, fringe, -1.0f);
+	glnvg__convertPaint(gl, frag, paint, scissor, 1.0f, fringe, -1.0f, call->origin, call->boundRadius);
 	frag->type = NSVG_SHADER_IMG;
 
 	return;
