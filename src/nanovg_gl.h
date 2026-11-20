@@ -867,6 +867,14 @@ static int glnvg__renderUpdateTexture(void* uptr, int image, int x, int y, int w
 	glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 #endif
 
+	// Rebuild the mip chain so downscaled draws see the updated content.
+	// On GL2 mipmaps are regenerated automatically via GL_GENERATE_MIPMAP.
+#if !defined(NANOVG_GL2)
+	if (tex->flags & NVG_IMAGE_GENERATE_MIPMAPS) {
+		glGenerateMipmap(GL_TEXTURE_2D);
+	}
+#endif
+
 	glnvg__bindTexture(gl, 0);
 
 	return 1;
