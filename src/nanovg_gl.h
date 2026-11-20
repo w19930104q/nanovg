@@ -205,7 +205,7 @@ struct GLNVGfragUniforms {
 	#else
 		// note: after modifying layout or size of uniform array,
 		// don't forget to also update the fragment shader source!
-		#define NANOVG_GL_UNIFORMARRAY_SIZE 11
+		#define NANOVG_GL_UNIFORMARRAY_SIZE 13
 		union {
 			struct {
 				float scissorMat[12]; // matrices are actually 3 vec4s
@@ -221,6 +221,10 @@ struct GLNVGfragUniforms {
 				float strokeThr;
 				float texType;
 				float type;
+				float texRepeat[2];	// per-axis repeat emulation mask (1.0 = repeat), used for NPOT textures on GLES2
+				float texSize[2];	// texture size in texels, used for repeat emulation
+				float texNearest;	// 1.0 if the texture uses nearest filtering
+				float pad[3];
 			};
 			float uniformArray[NANOVG_GL_UNIFORMARRAY_SIZE][4];
 		};
@@ -528,7 +532,7 @@ static int glnvg__renderCreate(void* uptr)
 #if NANOVG_GL_USE_UNIFORMBUFFER
 	"#define USE_UNIFORMBUFFER 1\n"
 #else
-	"#define UNIFORMARRAY_SIZE 11\n"
+	"#define UNIFORMARRAY_SIZE 13\n"
 #endif
 	"\n";
 
@@ -604,6 +608,14 @@ static int glnvg__renderCreate(void* uptr)
 		"	#define strokeThr frag[10].y\n"
 		"	#define texType int(frag[10].z)\n"
 		"	#define type int(frag[10].w)\n"
+		"	#define texRepeat frag[11].xy\n"
+		"	#define texSize frag[11].zw\n"
+		"	#define texNearest frag[12].x\n"
+		"#else\n"
+		// NPOT repeat is supported in hardware when uniform buffers are used (GL3).
+		"	#define texRepeat vec2(0.0, 0.0)\n"
+		"	#define texSize vec2(1.0, 1.0)\n"
+		"	#define texNearest 0.0\n"
 		"#endif\n"
 		"\n"
 		"float sdroundrect(vec2 pt, vec2 ext, float rad) {\n"
@@ -625,6 +637,51 @@ static int glnvg__renderCreate(void* uptr)
 		"}\n"
 		"#endif\n"
 		"\n"
+		"vec4 glnvg__sampleTex(vec2 uv) {\n"
+		"#ifdef NANOVG_GL3\n"
+		"	return texture(tex, uv);\n"
+		"#else\n"
+		"	return texture2D(tex, uv);\n"
+		"#endif\n"
+		"}\n"
+		"\n"
+		"// Wraps a texture coordinate per axis: repeat (fract) where texRepeat is 1, clamp to edge otherwise.\n"
+		"vec2 glnvg__wrapUV(vec2 uv) {\n"
+		"	vec2 rep = fract(uv);\n"
+		"	vec2 clp = clamp(uv, vec2(0.0, 0.0), vec2(1.0, 1.0));\n"
+		"	return mix(clp, rep, texRepeat);\n"
+		"}\n"
+		"\n"
+		"// Wraps a texel index per axis: repeat (mod) where texRepeat is 1, clamp to edge otherwise.\n"
+		"vec2 glnvg__wrapTexel(vec2 i, vec2 size) {\n"
+		"	vec2 rep = mod(i, size);\n"
+		"	vec2 clp = clamp(i, vec2(0.0, 0.0), size - vec2(1.0, 1.0));\n"
+		"	return mix(clp, rep, texRepeat);\n"
+		"}\n"
+		"\n"
+		"// Samples the image texture. When texRepeat is non-zero (NPOT texture with repeat on GLES2),\n"
+		"// emulates GL_REPEAT in the shader since the hardware cannot repeat NPOT textures.\n"
+		"vec4 glnvg__sampleImage(vec2 uv) {\n"
+		"	if (texRepeat.x == 0.0 && texRepeat.y == 0.0)\n"
+		"		return glnvg__sampleTex(uv);\n"
+		"	uv = glnvg__wrapUV(uv);\n"
+		"	if (texNearest != 0.0) {\n"
+		"		vec2 i = min(floor(uv * texSize), texSize - vec2(1.0, 1.0));\n"
+		"		return glnvg__sampleTex((i + vec2(0.5, 0.5)) / texSize);\n"
+		"	}\n"
+		"	// Emulate bilinear filtering with wrapped texel fetches.\n"
+		"	vec2 x = uv * texSize - vec2(0.5, 0.5);\n"
+		"	vec2 i = floor(x);\n"
+		"	vec2 f = x - i;\n"
+		"	vec2 i0 = glnvg__wrapTexel(i, texSize);\n"
+		"	vec2 i1 = glnvg__wrapTexel(i + vec2(1.0, 1.0), texSize);\n"
+		"	vec4 c00 = glnvg__sampleTex((vec2(i0.x, i0.y) + vec2(0.5, 0.5)) / texSize);\n"
+		"	vec4 c10 = glnvg__sampleTex((vec2(i1.x, i0.y) + vec2(0.5, 0.5)) / texSize);\n"
+		"	vec4 c01 = glnvg__sampleTex((vec2(i0.x, i1.y) + vec2(0.5, 0.5)) / texSize);\n"
+		"	vec4 c11 = glnvg__sampleTex((vec2(i1.x, i1.y) + vec2(0.5, 0.5)) / texSize);\n"
+		"	return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);\n"
+		"}\n"
+		"\n"
 		"void main(void) {\n"
 		"   vec4 result;\n"
 		"	float scissor = scissorMask(fpos);\n"
@@ -645,11 +702,7 @@ static int glnvg__renderCreate(void* uptr)
 		"	} else if (type == 1) {		// Image\n"
 		"		// Calculate color fron texture\n"
 		"		vec2 pt = (paintMat * vec3(fpos,1.0)).xy / extent;\n"
-		"#ifdef NANOVG_GL3\n"
-		"		vec4 color = texture(tex, pt);\n"
-		"#else\n"
-		"		vec4 color = texture2D(tex, pt);\n"
-		"#endif\n"
+		"		vec4 color = glnvg__sampleImage(pt);\n"
 		"		if (texType == 1) color = vec4(color.xyz*color.w,color.w);"
 		"		if (texType == 2) color = vec4(color.x);"
 		"		// Apply color tint and alpha.\n"
@@ -660,11 +713,7 @@ static int glnvg__renderCreate(void* uptr)
 		"	} else if (type == 2) {		// Stencil fill\n"
 		"		result = vec4(1,1,1,1);\n"
 		"	} else if (type == 3) {		// Textured tris\n"
-		"#ifdef NANOVG_GL3\n"
-		"		vec4 color = texture(tex, ftcoord);\n"
-		"#else\n"
-		"		vec4 color = texture2D(tex, ftcoord);\n"
-		"#endif\n"
+		"		vec4 color = glnvg__sampleImage(ftcoord);\n"
 		"		if (texType == 1) color = vec4(color.xyz*color.w,color.w);"
 		"		if (texType == 2) color = vec4(color.x);"
 		"		color *= scissor;\n"
@@ -719,17 +768,16 @@ static int glnvg__renderCreateTexture(void* uptr, int type, int w, int h, int im
 {
 	GLNVGcontext* gl = (GLNVGcontext*)uptr;
 	GLNVGtexture* tex = glnvg__allocTexture(gl);
+	int hwRepeat = 1;
 
 	if (tex == NULL) return 0;
 
 #ifdef NANOVG_GLES2
 	// Check for non-power of 2.
 	if (glnvg__nearestPow2(w) != (unsigned int)w || glnvg__nearestPow2(h) != (unsigned int)h) {
-		// No repeat
-		if ((imageFlags & NVG_IMAGE_REPEATX) != 0 || (imageFlags & NVG_IMAGE_REPEATY) != 0) {
-			printf("Repeat X/Y is not supported for non power-of-two textures (%d x %d)\n", w, h);
-			imageFlags &= ~(NVG_IMAGE_REPEATX | NVG_IMAGE_REPEATY);
-		}
+		// Repeat is emulated in the fragment shader for non power-of-two textures,
+		// the hardware wrap must stay clamp-to-edge.
+		hwRepeat = 0;
 		// No mips.
 		if (imageFlags & NVG_IMAGE_GENERATE_MIPMAPS) {
 			printf("Mip-maps is not support for non power-of-two textures (%d x %d)\n", w, h);
@@ -790,12 +838,12 @@ static int glnvg__renderCreateTexture(void* uptr, int type, int w, int h, int im
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	}
 
-	if (imageFlags & NVG_IMAGE_REPEATX)
+	if ((imageFlags & NVG_IMAGE_REPEATX) != 0 && hwRepeat)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
 	else
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 
-	if (imageFlags & NVG_IMAGE_REPEATY)
+	if ((imageFlags & NVG_IMAGE_REPEATY) != 0 && hwRepeat)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 	else
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -964,6 +1012,19 @@ static int glnvg__convertPaint(GLNVGcontext* gl, GLNVGfragUniforms* frag, NVGpai
 		else
 			frag->texType = 2.0f;
 		#endif
+#ifdef NANOVG_GLES2
+		// GLES2 cannot repeat non power-of-two textures in hardware, flag the
+		// shader to emulate the requested wrap mode (see glnvg__sampleImage).
+		if ((tex->flags & (NVG_IMAGE_REPEATX | NVG_IMAGE_REPEATY)) != 0 &&
+			(glnvg__nearestPow2(tex->width) != (unsigned int)tex->width ||
+			 glnvg__nearestPow2(tex->height) != (unsigned int)tex->height)) {
+			frag->texRepeat[0] = (tex->flags & NVG_IMAGE_REPEATX) != 0 ? 1.0f : 0.0f;
+			frag->texRepeat[1] = (tex->flags & NVG_IMAGE_REPEATY) != 0 ? 1.0f : 0.0f;
+			frag->texSize[0] = (float)tex->width;
+			frag->texSize[1] = (float)tex->height;
+			frag->texNearest = (tex->flags & NVG_IMAGE_NEAREST) != 0 ? 1.0f : 0.0f;
+		}
+#endif
 //		printf("frag->texType = %d\n", frag->texType);
 	} else {
 		frag->type = NSVG_SHADER_FILLGRAD;
